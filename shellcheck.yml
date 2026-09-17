@@ -1,0 +1,31 @@
+name: shellcheck
+
+on:
+  push:
+    paths: ['**.sh', '.github/workflows/shellcheck.yml']
+  pull_request:
+    paths: ['**.sh']
+  workflow_dispatch:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: Syntax check
+        run: bash -n themasterbench.sh
+
+      - name: ShellCheck
+        # SC2086 (word splitting) and SC1091 (sourced files) are noisy here by design
+        run: shellcheck --severity=warning --exclude=SC2086,SC1091 themasterbench.sh
+
+      - name: Dry run must complete cleanly
+        run: |
+          chmod +x themasterbench.sh
+          ./themasterbench.sh --all --dry-run > /tmp/dry.log 2>&1
+          echo "exit=$?"
+          ! grep -qE 'Unhandled error' /tmp/dry.log
