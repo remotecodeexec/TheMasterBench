@@ -35,7 +35,9 @@ MANIFEST="${OPT_DIR}/MANIFEST.md"
 #--- Runtime flags ------------------------------------------------------------
 DRY_RUN=0
 FORCE=0
-ASSUME_YES=1
+INTERACTIVE=auto      # auto | 1 (--interactive) | 0 (--yes: never prompt)
+PROFILE=""
+declare -A SET_BY_FLAG=()   # options given on the command line; the wizard won't re-ask
 declare -a SELECTED=()
 declare -a SKIPPED=()
 declare -a MISSING_PKGS=()
@@ -92,6 +94,27 @@ declare -A MODULE_DESC=(
   [collection]="Velociraptor binary + offline collector workflow"
   [ghidra]="Ghidra reverse-engineering suite (large download)"
   [reporting]="Case scaffolding, note-taking, report helpers"
+)
+
+#--- Profiles: named module sets (keep modules in ALL_MODULES order) ----------
+declare -a PROFILE_ORDER=(full windows macos linux memory malware minimal)
+declare -A PROFILE_MODULES=(
+  [full]="${ALL_MODULES[*]}"
+  [windows]="core hygiene acquisition filesystems carving triage memory windows ez_tools browsers email reporting"
+  [macos]="core hygiene acquisition filesystems carving triage macos browsers reporting"
+  [linux]="core hygiene acquisition filesystems carving triage memory linuxart reporting"
+  [memory]="core hygiene triage memory reporting"
+  [malware]="core hygiene triage malware network ghidra reporting"
+  [minimal]="core hygiene acquisition triage reporting"
+)
+declare -A PROFILE_DESC=(
+  [full]="Every module"
+  [windows]="Windows host investigations"
+  [macos]="macOS host investigations"
+  [linux]="Linux host investigations"
+  [memory]="Memory analysis"
+  [malware]="Malware and network analysis, reverse engineering"
+  [minimal]="Imaging, triage and case tooling only"
 )
 
 #===============================================================================
@@ -858,6 +881,232 @@ verify_only() {
 }
 
 #===============================================================================
+# Interactive wizard
+#
+# Runs when the script is started from a terminal with no module selection, or
+# with --interactive. Options given on the command line are taken as answers
+# (and as the wizard's starting selection); --yes or a non-terminal never
+# prompts. Uses whiptail when available, plain read prompts otherwise.
+#===============================================================================
+use_tui() { have whiptail && [[ "${TERM:-dumb}" != "dumb" ]]; }
+
+want_wizard() {
+  case "$INTERACTIVE" in
+    1) return 0 ;;
+    0) return 1 ;;
+  esac
+  ((${#SELECTED[@]} == 0)) && [[ -t 0 && -t 1 ]]
+}
+
+# whiptail prints its answer on stderr; swap fds so $(...) captures it.
+_wt() { whiptail --backtitle "TheMasterBench v${SCRIPT_VERSION}" "$@" 3>&1 1>&2 2>&3; }
+
+# Sets WT_H / WT_W / WT_LIST from the terminal size, for list dialogs.
+_wt_size() {
+  local lines cols
+  lines=$(tput lines 2>/dev/null || echo 24)
+  cols=$(tput cols 2>/dev/null || echo 80)
+  WT_H=$(( lines - 2 )); WT_W=$(( cols - 4 ))
+  (( WT_W > 120 )) && WT_W=120
+  WT_LIST=$(( WT_H - 8 ))
+}
+
+module_is_done() { [[ -f "${STATE_DIR}/$1.done" ]]; }
+
+# ask_yn <question> [y|n] -- returns 0 for yes, 1 for no; Esc / EOF cancels.
+ask_yn() {
+  local q="$1" def="${2:-y}" ans rc=0
+  if use_tui; then
+    local extra=()
+    [[ "$def" == "n" ]] && extra=(--defaultno)
+    # Height = text lines after wrapping to the box width, plus borders/buttons.
+    local h
+    _wt_size
+    h=$(printf '%s\n' "$q" | awk -v w=$(( WT_W - 4 )) \
+      '{ n += (length($0) > w) ? int((length($0) + w - 1) / w) : 1 } END { print n + 7 }')
+    (( h > WT_H )) && h=$WT_H
+    _wt "${extra[@]}" --title "TheMasterBench" --yesno "$q" "$h" "$WT_W" || rc=$?
+    (( rc == 255 )) && die "Cancelled."
+    return "$rc"
+  fi
+  local hint="[Y/n]"; [[ "$def" == "n" ]] && hint="[y/N]"
+  while :; do
+    printf '\n%s\n' "$q"
+    read -rp "${hint} " ans || die "Cancelled."
+    ans="${ans:-$def}"
+    case "${ans,,}" in
+      y|yes) return 0 ;;
+      n|no)  return 1 ;;
+    esac
+    echo "Please answer y or n."
+  done
+}
+
+# Choose a starting profile; fills SELECTED (empty for 'custom').
+pick_profile() {
+  local names=("${PROFILE_ORDER[@]}" custom) choice p i
+  if use_tui; then
+    _wt_size
+    local items=()
+    for p in "${PROFILE_ORDER[@]}"; do items+=("$p" "${PROFILE_DESC[$p]}"); done
+    items+=(custom "Pick modules yourself")
+    choice=$(_wt --title "Profile" --default-item "${PROFILE:-full}" \
+      --menu "Choose a starting profile. You can adjust the modules on the next screen." \
+      "$WT_H" "$WT_W" "$WT_LIST" "${items[@]}") || die "Cancelled."
+  else
+    printf '\n%sProfiles%s\n' "$C_BLU" "$C_RESET"
+    for i in "${!names[@]}"; do
+      p="${names[$i]}"
+      printf '  %d) %-9s %s\n' "$(( i + 1 ))" "$p" "${PROFILE_DESC[$p]:-Pick modules yourself}"
+    done
+    while :; do
+      read -rp "Profile [1]: " choice || die "Cancelled."
+      choice="${choice:-1}"
+      if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#names[@]} )); then
+        choice="${names[$(( choice - 1 ))]}"
+        break
+      fi
+      in_array "$choice" "${names[@]}" && break
+      echo "Enter a number from 1 to ${#names[@]}."
+    done
+  fi
+  if [[ "$choice" == "custom" ]]; then
+    PROFILE=""; SELECTED=()
+  else
+    PROFILE="$choice"
+    read -ra SELECTED <<< "${PROFILE_MODULES[$choice]}"
+  fi
+}
+
+# Checklist of modules, starting from SELECTED minus SKIPPED. The result
+# replaces both (the checklist is the final word), in ALL_MODULES order.
+pick_modules() {
+  local -A sel=()
+  local m
+  for m in "${SELECTED[@]}"; do sel[$m]=1; done
+  for m in "${SKIPPED[@]}"; do unset "sel[$m]"; done
+  sel[core]=1
+
+  if use_tui; then
+    _wt_size
+    local items=() desc out
+    for m in "${ALL_MODULES[@]}"; do
+      desc="${MODULE_DESC[$m]}"
+      [[ "$m" == "core" ]] && desc="(always included) ${desc}"
+      module_is_done "$m" && desc="(done) ${desc}"
+      items+=("$m" "$desc" "$([[ -n "${sel[$m]:-}" ]] && echo ON || echo OFF)")
+    done
+    while :; do
+      out=$(_wt --title "Modules" --separate-output --checklist \
+        "Space toggles a module, Enter continues. (done) = already completed." \
+        "$WT_H" "$WT_W" "$WT_LIST" "${items[@]}") || die "Cancelled."
+      [[ -n "$out" ]] && break
+      _wt --title "Modules" --msgbox "Select at least one module." 8 40 || true
+    done
+    sel=([core]=1)
+    while IFS= read -r m; do [[ -n "$m" ]] && sel[$m]=1; done <<< "$out"
+  else
+    local input tok a b i
+    while :; do
+      printf '\n%sModules%s  (* = selected, done = already completed)\n' "$C_BLU" "$C_RESET"
+      for i in "${!ALL_MODULES[@]}"; do
+        m="${ALL_MODULES[$i]}"
+        printf '  %2d) [%s] %-12s %-5s %s\n' "$(( i + 1 ))" \
+          "$([[ -n "${sel[$m]:-}" ]] && echo '*' || echo ' ')" "$m" \
+          "$(module_is_done "$m" && echo "done" || true)" "${MODULE_DESC[$m]}"
+      done
+      echo "Toggle by number or range (e.g. 3,5-7), 'a' = all, 'n' = none, Enter = continue."
+      read -rp "> " input || die "Cancelled."
+      case "${input,,}" in
+        "") break ;;
+        a|all)  for m in "${ALL_MODULES[@]}"; do sel[$m]=1; done; continue ;;
+        n|none) sel=([core]=1); continue ;;
+      esac
+      for tok in ${input//,/ }; do
+        if [[ "$tok" =~ ^([0-9]+)(-([0-9]+))?$ ]]; then
+          a="${BASH_REMATCH[1]}"; b="${BASH_REMATCH[3]:-$a}"
+          if (( a < 1 || b > ${#ALL_MODULES[@]} || a > b )); then
+            warn "Out of range: ${tok}"; continue
+          fi
+          for (( i = a; i <= b; i++ )); do
+            m="${ALL_MODULES[$(( i - 1 ))]}"
+            if [[ -n "${sel[$m]:-}" ]]; then unset "sel[$m]"; else sel[$m]=1; fi
+          done
+        else
+          warn "Not a number or range: ${tok}"
+        fi
+      done
+      if [[ -z "${sel[core]:-}" ]]; then
+        warn "'core' is always included"; sel[core]=1
+      fi
+    done
+  fi
+
+  SELECTED=(); SKIPPED=()
+  for m in "${ALL_MODULES[@]}"; do [[ -n "${sel[$m]:-}" ]] && SELECTED+=("$m"); done
+  # Drop the profile name if the selection no longer matches it.
+  [[ -n "$PROFILE" && "${SELECTED[*]}" != "${PROFILE_MODULES[$PROFILE]}" ]] && PROFILE=""
+  return 0
+}
+
+# If any selected module is already completed, offer to re-run it.
+ask_force() {
+  [[ -n "${SET_BY_FLAG[force]:-}" ]] && return 0
+  local done_mods=() m
+  for m in "${SELECTED[@]}"; do module_is_done "$m" && done_mods+=("$m"); done
+  ((${#done_mods[@]})) || { FORCE=0; return 0; }
+  if ask_yn "Already completed: ${done_mods[*]}
+
+Re-run these modules (--force)? If you answer no, they are skipped." n; then
+    FORCE=1
+  else
+    FORCE=0
+  fi
+}
+
+# The command line that reproduces the current choices without prompts.
+equivalent_cmd() {
+  local cmd="sudo ./${SCRIPT_NAME}"
+  if [[ -n "$PROFILE" ]]; then
+    cmd+=" --profile ${PROFILE}"
+  elif [[ "${SELECTED[*]}" == "${ALL_MODULES[*]}" ]]; then
+    cmd+=" --all"
+  else
+    cmd+=" --only $(IFS=,; echo "${SELECTED[*]}")"
+  fi
+  ((${#SKIPPED[@]})) && cmd+=" --skip $(IFS=,; echo "${SKIPPED[*]}")"
+  (( FORCE ))   && cmd+=" --force"
+  (( DRY_RUN )) && cmd+=" --dry-run"
+  printf '%s --yes' "$cmd"
+}
+
+summary_text() {
+  local done_mods=() m
+  for m in "${SELECTED[@]}"; do module_is_done "$m" && done_mods+=("$m"); done
+  printf 'Modules:   %s\n' "${SELECTED[*]}"
+  [[ -n "$PROFILE" ]] && printf 'Profile:   %s\n' "$PROFILE"
+  if ((${#done_mods[@]})); then
+    printf 'Completed: %s (%s)\n' "${done_mods[*]}" "$( (( FORCE )) && echo 're-run' || echo 'skipped')"
+  fi
+  printf 'User:      %s (%s)\n' "$TARGET_USER" "$TARGET_HOME"
+  printf 'Dry run:   %s\n' "$( (( DRY_RUN )) && echo yes || echo no)"
+  printf '\nEquivalent command:\n  %s\n' "$(equivalent_cmd)"
+}
+
+run_wizard() {
+  [[ -t 0 && -t 1 ]] || die "--interactive needs a terminal."
+  [[ -n "${SET_BY_FLAG[selection]:-}" ]] || pick_profile
+  while :; do
+    pick_modules
+    ask_force
+    ask_yn "$(summary_text)
+
+Proceed? Choose No to change the selection." y && break
+  done
+  printf '\n%sEquivalent command:%s %s\n' "$C_DIM" "$C_RESET" "$(equivalent_cmd)"
+}
+
+#===============================================================================
 # CLI
 #===============================================================================
 usage() {
@@ -865,24 +1114,32 @@ usage() {
 TheMasterBench v${SCRIPT_VERSION} (${SCRIPT_NAME}) - Kali -> DFIR workstation provisioner
 
 USAGE
+  sudo ./${SCRIPT_NAME}                      # interactive setup wizard
   sudo ./${SCRIPT_NAME} --all
   sudo ./${SCRIPT_NAME} --only core,windows,memory
+  sudo ./${SCRIPT_NAME} --profile windows
   sudo ./${SCRIPT_NAME} --all --skip ghidra,mobile
   sudo ./${SCRIPT_NAME} --all --force        # re-run completed modules
+  sudo ./${SCRIPT_NAME} -i --profile memory  # wizard, starting from a profile
        ./${SCRIPT_NAME} --verify             # report what is installed
-       ./${SCRIPT_NAME} --list               # list modules
+       ./${SCRIPT_NAME} --list               # list modules and profiles
 
 OPTIONS
   --all                Run every module
   --only  a,b,c        Run only these modules
+  --profile NAME       Run a predefined module set (see --list)
   --skip  a,b,c        Exclude these modules
   --force              Ignore completion markers and redo everything
   --dry-run            Print what would happen, change nothing
-  --list               Show available modules
+  -i, --interactive    Open the wizard; other options become its defaults
+  -y, --yes            Never prompt (also: --non-interactive)
+  --list               Show available modules and profiles
   --verify             Check which tools are present (no root required)
   -h, --help           This message
 
 NOTES
+  * With no options in a terminal, the wizard asks what to install. Without
+    a terminal (CI, pipes) and no options, this help is shown instead.
   * 'core' is always run first when other modules are selected.
   * Missing upstream packages are logged, never fatal.
   * Re-running after a VM rebuild reproduces the same state.
@@ -891,22 +1148,36 @@ EOF
 
 list_modules() {
   printf '\n%sAvailable modules%s\n\n' "$C_BLU" "$C_RESET"
-  local m
+  local m p
   for m in "${ALL_MODULES[@]}"; do
     printf '  %-14s %s\n' "$m" "${MODULE_DESC[$m]:-}"
+  done
+  printf '\n%sProfiles%s (--profile NAME)\n\n' "$C_BLU" "$C_RESET"
+  for p in "${PROFILE_ORDER[@]}"; do
+    printf '  %-14s %s\n' "$p" "${PROFILE_DESC[$p]}"
+    [[ "$p" == "full" ]] || printf '  %-14s %s%s%s\n' "" "$C_DIM" "${PROFILE_MODULES[$p]}" "$C_RESET"
   done
   echo
 }
 
+# need_arg <option> <value> -- die unless the option was given a value.
+need_arg() { [[ -n "${2:-}" && "$2" != -* ]] || die "$1 needs a value (try --help)"; }
+
 parse_args() {
-  [[ $# -eq 0 ]] && { usage; exit 0; }
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --all)     SELECTED=("${ALL_MODULES[@]}") ;;
-      --only)    IFS=',' read -ra SELECTED <<< "${2:?--only needs a list}"; shift ;;
-      --skip)    IFS=',' read -ra SKIPPED  <<< "${2:?--skip needs a list}"; shift ;;
-      --force)   FORCE=1 ;;
-      --dry-run) DRY_RUN=1 ;;
+      --all)     SELECTED=("${ALL_MODULES[@]}"); PROFILE=""; SET_BY_FLAG[selection]=1 ;;
+      --only)    need_arg "$1" "${2:-}"; IFS=',' read -ra SELECTED <<< "$2"
+                 PROFILE=""; SET_BY_FLAG[selection]=1; shift ;;
+      --profile) need_arg "$1" "${2:-}"
+                 [[ -n "${PROFILE_MODULES[$2]:-}" ]] || die "Unknown profile: $2 (see --list)"
+                 PROFILE="$2"; read -ra SELECTED <<< "${PROFILE_MODULES[$2]}"
+                 SET_BY_FLAG[selection]=1; shift ;;
+      --skip)    need_arg "$1" "${2:-}"; IFS=',' read -ra SKIPPED <<< "$2"; shift ;;
+      --force)   FORCE=1; SET_BY_FLAG[force]=1 ;;
+      --dry-run) DRY_RUN=1; SET_BY_FLAG[dry_run]=1 ;;
+      -i|--interactive)          INTERACTIVE=1 ;;
+      -y|--yes|--non-interactive) INTERACTIVE=0 ;;
       --list)    list_modules; exit 0 ;;
       --verify)  verify_only; exit 0 ;;
       -h|--help) usage; exit 0 ;;
@@ -921,17 +1192,28 @@ in_array() { local n="$1"; shift; local e; for e in "$@"; do [[ "$e" == "$n" ]] 
 main() {
   parse_args "$@"
 
-  ((${#SELECTED[@]})) || die "Nothing selected. Use --all or --only <modules>."
+  # Validate names before the wizard uses them as defaults.
+  local m
+  for m in "${SELECTED[@]}" "${SKIPPED[@]}"; do
+    in_array "$m" "${ALL_MODULES[@]}" || die "Unknown module: ${m} (see --list)"
+  done
+
+  if want_wizard; then
+    is_root || (( DRY_RUN )) || \
+      die "The setup wizard installs system packages: run it with sudo (or add --dry-run to preview)."
+    run_wizard
+  elif (( $# == 0 )); then
+    usage; exit 0
+  fi
+
+  ((${#SELECTED[@]})) || die "Nothing selected. Use --all, --only <modules> or --profile <name>."
   is_root || (( DRY_RUN )) || die "Run with sudo (installs system packages)."
 
   (( DRY_RUN )) || { mkdir -p "$(dirname "$LOG_FILE")"; touch "$LOG_FILE"; }
   _log_raw "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} start (user=${TARGET_USER}) ==="
+  _log_raw "Equivalent command: $(equivalent_cmd)"
 
-  # Validate names and always front-load 'core'
-  local m
-  for m in "${SELECTED[@]}"; do
-    in_array "$m" "${ALL_MODULES[@]}" || die "Unknown module: ${m} (see --list)"
-  done
+  # Always front-load 'core'
   if ! in_array core "${SELECTED[@]}"; then
     SELECTED=(core "${SELECTED[@]}")
   fi

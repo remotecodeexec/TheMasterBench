@@ -35,17 +35,39 @@ cd TheMasterBench
 chmod +x themasterbench.sh
 ```
 
-Install all modules:
+The easiest way to start is the setup wizard. Run the script with no options:
+
+```bash
+sudo ./themasterbench.sh
+```
+
+It asks you to choose a starting profile, lets you tick or untick modules, asks
+whether to rerun modules that are already complete, then shows a summary before
+anything is installed. The summary includes the equivalent command, so you can
+repeat the same setup later without prompts. The wizard uses `whiptail` when it
+is available and plain text prompts otherwise.
+
+You can also choose modules with options and skip the wizard. Install all modules:
 
 ```bash
 sudo ./themasterbench.sh --all
 ```
 
-Or start with a smaller selection:
+Use a predefined profile (see `--list` for what each one includes):
+
+```bash
+sudo ./themasterbench.sh --profile windows
+```
+
+Or pick the modules yourself:
 
 ```bash
 sudo ./themasterbench.sh --only core,hygiene,windows,memory
 ```
+
+Add `-i` to open the wizard with your options already filled in, for example
+`sudo ./themasterbench.sh -i --profile memory`. Add `-y` to make sure the script
+never prompts. It never prompts when it is not run from a terminal.
 
 The script adds `core` automatically when it is not included in your selection.
 Installation time and disk usage depend on the modules and downloads required.
@@ -92,8 +114,11 @@ varies with your Kali release and the upstream projects.
 
 | Command | What it does |
 | --- | --- |
-| `./themasterbench.sh --list` | List the available modules |
+| `sudo ./themasterbench.sh` | Start the interactive setup wizard |
+| `./themasterbench.sh --list` | List the available modules and profiles |
 | `./themasterbench.sh --help` | Show command options |
+| `sudo ./themasterbench.sh --profile memory` | Install a predefined set of modules |
+| `sudo ./themasterbench.sh -i --only windows,memory` | Open the wizard with these modules preselected |
 | `sudo ./themasterbench.sh --all --skip ghidra,mobile` | Install everything except the named modules |
 | `sudo ./themasterbench.sh --only windows --force` | Rerun Windows setup and the automatically included core module |
 | `./themasterbench.sh --all --dry-run` | Preview setup commands; may still query upstream releases and write logs if permitted |
