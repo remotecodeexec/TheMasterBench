@@ -42,7 +42,8 @@ sudo ./themasterbench.sh
 ```
 
 It asks you to choose a starting profile, lets you tick or untick modules, asks
-whether to rerun modules that are already complete, then shows a summary before
+whether to rerun modules that are already complete, and lets you change settings
+such as the account to set up and the case folder. It then shows a summary before
 anything is installed. The summary includes the equivalent command, so you can
 repeat the same setup later without prompts. The wizard uses `whiptail` when it
 is available and plain text prompts otherwise.
@@ -127,6 +128,28 @@ varies with your Kali release and the upstream projects.
 Completed modules are normally skipped. Use `--force` to rerun a module after a
 partial installation. It does not guarantee that every installed tool is upgraded.
 
+## Settings
+
+These options can also be changed on the wizard's Settings screen:
+
+| Option | Default | What it changes |
+| --- | --- | --- |
+| `--user NAME` | The account that ran `sudo` | Account that gets the groups, command-line tools and file ownership |
+| `--opt-dir DIR` | `/opt/themasterbench` | Folder for downloaded tools, repositories and the manifest |
+| `--case-root DIR` | `/cases` | Folder where `bench-new-case` creates cases |
+| `--evidence-root DIR` | `/evidence` | Default mount folder for `bench-mount-ro` |
+| `--no-udev-ro` | Rule installed | Don't force removable disks read-only |
+| `--no-polkit` | Rule installed | Don't require an admin password to mount removable media |
+
+The last four apply to the `hygiene` module. Settings are not remembered between
+runs, so pass the same options again when you rerun it, for example:
+
+```bash
+sudo ./themasterbench.sh --only hygiene --force --case-root /srv/cases --no-polkit
+```
+
+If an earlier run installed a rule, `--no-udev-ro` or `--no-polkit` removes it.
+
 ## Working with cases
 
 The `hygiene` module installs `bench-new-case`:
@@ -135,7 +158,7 @@ The `hygiene` module installs `bench-new-case`:
 bench-new-case CASE-2026-001 "Laptop investigation"
 ```
 
-This creates `/cases/CASE-2026-001/` with folders for administration, acquisition,
+This creates `/cases/CASE-2026-001/` (or the folder set with `--case-root`) with folders for administration, acquisition,
 evidence, working files, outputs, tools, and temporary work. The case notes include
 an evidence register, a chain-of-custody table, and an activity log for you to fill in.
 
@@ -149,10 +172,10 @@ and mount helper are additional precautions, not a replacement.
 
 | Path | Contents |
 | --- | --- |
-| `/opt/themasterbench/` | Downloaded repositories, tools, and symbol packs |
+| `/opt/themasterbench/` | Downloaded repositories, tools, and symbol packs (`--opt-dir`) |
 | `/opt/themasterbench/MANIFEST.md` | Detected tool paths and versions, plus recorded installation problems |
-| `/cases/` | Case working directories |
-| `/evidence/` | Intended mount points for evidence |
+| `/cases/` | Case working directories (`--case-root`) |
+| `/evidence/` | Intended mount points for evidence (`--evidence-root`) |
 | `/var/lib/themasterbench/` | Module completion markers |
 | `/var/log/themasterbench.log` | Setup log |
 

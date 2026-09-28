@@ -25,18 +25,25 @@ SCRIPT_VERSION="1.0.0"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 
 #--- Paths --------------------------------------------------------------------
-OPT_DIR="/opt/themasterbench"           # third-party tools cloned/unpacked here
+# OPT_DIR, CASE_ROOT and EVIDENCE_ROOT can be changed with --opt-dir,
+# --case-root and --evidence-root, or in the wizard.
+DEFAULT_OPT_DIR="/opt/themasterbench"
+DEFAULT_CASE_ROOT="/cases"
+DEFAULT_EVIDENCE_ROOT="/evidence"
+OPT_DIR="$DEFAULT_OPT_DIR"              # third-party tools cloned/unpacked here
 STATE_DIR="/var/lib/themasterbench"     # per-module completion markers
 LOG_FILE="/var/log/themasterbench.log"  # provisioning log
-CASE_ROOT="/cases"                      # working case data
-EVIDENCE_ROOT="/evidence"               # mount point for read-only source media
-MANIFEST="${OPT_DIR}/MANIFEST.md"
+CASE_ROOT="$DEFAULT_CASE_ROOT"          # working case data
+EVIDENCE_ROOT="$DEFAULT_EVIDENCE_ROOT"  # mount point for read-only source media
+MANIFEST="${OPT_DIR}/MANIFEST.md"       # recomputed once OPT_DIR is final
 
 #--- Runtime flags ------------------------------------------------------------
 DRY_RUN=0
 FORCE=0
 INTERACTIVE=auto      # auto | 1 (--interactive) | 0 (--yes: never prompt)
 PROFILE=""
+UDEV_RO=1             # hygiene: udev rule forcing removable disks read-only (--no-udev-ro)
+POLKIT_RULE=1         # hygiene: admin auth for mounting removable media (--no-polkit)
 declare -A SET_BY_FLAG=()   # options given on the command line; the wizard won't re-ask
 declare -a SELECTED=()
 declare -a SKIPPED=()
@@ -48,6 +55,7 @@ TARGET_USER="${SUDO_USER:-${USER:-root}}"
 [[ "$TARGET_USER" == "root" && -n "${SUDO_USER:-}" ]] && TARGET_USER="$SUDO_USER"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 TARGET_HOME="${TARGET_HOME:-/root}"
+DEFAULT_TARGET_USER="$TARGET_USER"      # --user or the wizard can change it
 
 #===============================================================================
 # Module registry  (order matters: 'core' first)
@@ -329,6 +337,16 @@ module_core() {
   ok "core ready"
 }
 
+POLKIT_RULE_FILE="/etc/polkit-1/rules.d/10-themasterbench-no-automount.rules"
+UDEV_RO_FILE="/etc/udev/rules.d/99-themasterbench-removable-ro.rules"
+
+# drop_rule <file> <what> -- remove a rule an earlier run installed.
+drop_rule() {
+  [[ -f "$1" ]] || { log "Not installing $2"; return 0; }
+  run rm -f "$1"
+  ok "Removed $2: $1"
+}
+
 module_hygiene() {
   hdr "hygiene - forensic defaults, groups, case tree"
 
@@ -344,10 +362,12 @@ module_hygiene() {
     as_user gsettings set org.gnome.desktop.media-handling automount-open false 2>/dev/null || true
     as_user gsettings set org.gnome.desktop.media-handling autorun-never true   2>/dev/null || true
   fi
-  if [[ -d /etc/udisks2 ]] || pkg_installed udisks2; then
+  if (( ! POLKIT_RULE )); then
+    drop_rule "$POLKIT_RULE_FILE" "polkit mount rule (--no-polkit)"
+  elif [[ -d /etc/udisks2 ]] || pkg_installed udisks2; then
     (( DRY_RUN )) || {
       mkdir -p /etc/polkit-1/rules.d
-      cat > /etc/polkit-1/rules.d/10-themasterbench-no-automount.rules <<'EOF'
+      cat > "$POLKIT_RULE_FILE" <<'EOF'
 // TheMasterBench: deny unprivileged filesystem mounting of removable media.
 // Evidence is mounted deliberately, read-only, by the examiner.
 polkit.addRule(function(action, subject) {
@@ -363,7 +383,10 @@ EOF
 
   # 3. Optional: force removable block devices read-only at the kernel level.
   #    NOT a replacement for a hardware write blocker - it is a second net.
-  (( DRY_RUN )) || cat > /etc/udev/rules.d/99-themasterbench-removable-ro.rules <<'EOF'
+  if (( ! UDEV_RO )); then
+    drop_rule "$UDEV_RO_FILE" "udev read-only rule (--no-udev-ro)"
+  else
+    (( DRY_RUN )) || cat > "$UDEV_RO_FILE" <<'EOF'
 # TheMasterBench - force newly attached removable block devices read-only.
 # This is a software safety net, NOT a substitute for a hardware write blocker.
 # Comment this file out (or `blockdev --setrw`) when you deliberately need write access.
@@ -372,8 +395,9 @@ ACTION=="add", KERNEL=="sd[a-z]", SUBSYSTEM=="block", ATTR{removable}=="1", \
 ACTION=="add", KERNEL=="sd[a-z][0-9]", SUBSYSTEM=="block", \
   RUN+="/bin/sh -c '[ \"$(cat /sys/block/$(echo %k | sed \"s/[0-9]*$//\")/removable 2>/dev/null)\" = 1 ] && /sbin/blockdev --setro /dev/%k || true'"
 EOF
+    ok "udev read-only rule installed (${UDEV_RO_FILE##*/})"
+  fi
   run udevadm control --reload-rules 2>/dev/null || true
-  ok "udev read-only rule installed (99-themasterbench-removable-ro.rules)"
 
   # 4. Groups the examiner needs
   local g
@@ -392,7 +416,7 @@ EOF
 # Mounts read-only with no atime updates and no journal replay.
 set -euo pipefail
 SRC="${1:?usage: bench-mount-ro <image|device> [mountpoint] [--offset BYTES]}"
-MNT="${2:-/evidence/$(basename "$SRC" | tr -c 'A-Za-z0-9._-' '_')}"
+MNT="${2:-@EVIDENCE_ROOT@/$(basename "$SRC" | tr -c 'A-Za-z0-9._-' '_')}"
 OFFSET=""
 [[ "${3:-}" == "--offset" ]] && OFFSET=",offset=${4:?offset value}"
 mkdir -p "$MNT"
@@ -413,7 +437,7 @@ EOF
 set -euo pipefail
 CASE_ID="${1:?usage: bench-new-case <case-id> [description]}"
 DESC="${2:-}"
-ROOT="/cases/${CASE_ID}"
+ROOT="@CASE_ROOT@/${CASE_ID}"
 [[ -e "$ROOT" ]] && { echo "Case already exists: $ROOT" >&2; exit 1; }
 mkdir -p "$ROOT"/{00_admin,01_acquisition,02_evidence,03_working,04_output/{timelines,reports,exports},05_tools,99_scratch}
 cat > "$ROOT/00_admin/case.md" <<META
@@ -443,6 +467,9 @@ echo "[+] Created $ROOT"
 tree -L 2 "$ROOT" 2>/dev/null || find "$ROOT" -maxdepth 2
 EOF
     chmod 0755 /usr/local/bin/bench-new-case
+    # Paths are validated to [A-Za-z0-9._/-], so they are safe in sed.
+    sed -i -e "s|@CASE_ROOT@|${CASE_ROOT}|g" -e "s|@EVIDENCE_ROOT@|${EVIDENCE_ROOT}|g" \
+      /usr/local/bin/bench-mount-ro /usr/local/bin/bench-new-case
   }
   ok "helpers installed: bench-mount-ro, bench-new-case"
 }
@@ -1065,6 +1092,121 @@ Re-run these modules (--force)? If you answer no, they are skipped." n; then
 }
 
 # The command line that reproduces the current choices without prompts.
+#--- Settings: user, folders, hygiene rules -----------------------------------
+
+# valid_path <path> -- absolute, and only characters that are safe unquoted
+# in the generated helpers and in sed replacements.
+valid_path() {
+  [[ "$1" =~ ^/[A-Za-z0-9._/-]*[A-Za-z0-9._-]$ && "$1" != *..* ]]
+}
+
+# set_target_user <name> -- switch the examiner account; fails if unknown.
+set_target_user() {
+  local home
+  home="$(getent passwd "$1" 2>/dev/null | cut -d: -f6)" || true
+  [[ -n "$1" && -n "$home" ]] || return 1
+  TARGET_USER="$1"; TARGET_HOME="$home"
+}
+
+# check_settings -- die on settings given as options that cannot work.
+check_settings() {
+  local name val
+  for name in OPT_DIR CASE_ROOT EVIDENCE_ROOT; do
+    val="${!name}"
+    valid_path "$val" || die "Invalid folder: ${val} (absolute path; letters, digits, . _ - / only)"
+  done
+}
+
+onoff() { (( $1 )) && echo on || echo off; }
+
+# ask_input <prompt> <default> -- prints the answer; Cancel keeps the default.
+# Runs in $(...), so on EOF it returns 1 and the caller must stop.
+ask_input() {
+  local q="$1" def="$2" ans
+  if use_tui; then
+    _wt_size
+    ans=$(_wt --title "TheMasterBench" --inputbox "$q" 10 "$WT_W" "$def") || ans="$def"
+  else
+    read -rp "${q} [${def}]: " ans || return 1
+  fi
+  printf '%s' "${ans:-$def}"
+}
+
+tell() {  # tell <message> -- show a short notice in the current UI
+  if use_tui; then _wt --title "TheMasterBench" --msgbox "$1" 9 60 || true
+  else warn "$1"; fi
+}
+
+# edit_path <variable> <label> -- prompt for a folder until it is valid.
+edit_path() {
+  local val
+  val=$(ask_input "$2 (absolute path):" "${!1}") || die "Cancelled."
+  if valid_path "$val"; then
+    printf -v "$1" '%s' "$val"
+  else
+    tell "Not a valid folder: ${val}
+Use an absolute path with letters, digits, . _ - and / only."
+  fi
+}
+
+# Menu of settings; pick one to change, or 'next' to continue. The hygiene
+# settings only show when the hygiene module is selected.
+edit_settings() {
+  local hyg=0 choice val i
+  in_array hygiene "${SELECTED[@]}" && hyg=1
+  local keys labels
+  while :; do
+    keys=(user tools); labels=(
+      "Examiner account:     ${TARGET_USER} (${TARGET_HOME})"
+      "Tools folder:         ${OPT_DIR}")
+    if (( hyg )); then
+      keys+=(cases evidence udev polkit)
+      labels+=(
+        "Case folder:          ${CASE_ROOT}"
+        "Evidence mounts:      ${EVIDENCE_ROOT}"
+        "Read-only USB disks:  $(onoff "$UDEV_RO")  (udev rule)"
+        "Mounting needs admin: $(onoff "$POLKIT_RULE")  (polkit rule)")
+    fi
+    keys+=(next); labels+=("Continue to the summary")
+
+    if use_tui; then
+      _wt_size
+      local items=()
+      for i in "${!keys[@]}"; do items+=("${keys[$i]}" "${labels[$i]}"); done
+      choice=$(_wt --title "Settings" --default-item next --notags \
+        --menu "Choose a setting to change, or continue." \
+        "$WT_H" "$WT_W" "$WT_LIST" "${items[@]}") || die "Cancelled."
+    else
+      printf '\n%sSettings%s\n' "$C_BLU" "$C_RESET"
+      for i in "${!keys[@]}"; do
+        [[ "${keys[$i]}" == "next" ]] && continue
+        printf '  %d) %s\n' "$(( i + 1 ))" "${labels[$i]}"
+      done
+      read -rp "Number to change, Enter to continue: " val || die "Cancelled."
+      if [[ -z "$val" ]]; then
+        choice=next
+      elif [[ "$val" =~ ^[0-9]+$ ]] && (( val >= 1 && val <= ${#keys[@]} )); then
+        choice="${keys[$(( val - 1 ))]}"
+      else
+        warn "Enter a number from 1 to $(( ${#keys[@]} - 1 ))."; continue
+      fi
+    fi
+
+    case "$choice" in
+      user)
+        val=$(ask_input "Account that will use the workstation (groups, pipx tools, file ownership):" "$TARGET_USER") \
+          || die "Cancelled."
+        set_target_user "$val" || tell "No such user: ${val}" ;;
+      tools)    edit_path OPT_DIR "Folder for downloaded tools and repositories" ;;
+      cases)    edit_path CASE_ROOT "Folder for case working directories" ;;
+      evidence) edit_path EVIDENCE_ROOT "Folder for read-only evidence mounts" ;;
+      udev)     UDEV_RO=$(( ! UDEV_RO )) ;;
+      polkit)   POLKIT_RULE=$(( ! POLKIT_RULE )) ;;
+      next)     return 0 ;;
+    esac
+  done
+}
+
 equivalent_cmd() {
   local cmd="sudo ./${SCRIPT_NAME}"
   if [[ -n "$PROFILE" ]]; then
@@ -1075,6 +1217,12 @@ equivalent_cmd() {
     cmd+=" --only $(IFS=,; echo "${SELECTED[*]}")"
   fi
   ((${#SKIPPED[@]})) && cmd+=" --skip $(IFS=,; echo "${SKIPPED[*]}")"
+  [[ "$TARGET_USER"   != "$DEFAULT_TARGET_USER"   ]] && cmd+=" --user ${TARGET_USER}"
+  [[ "$OPT_DIR"       != "$DEFAULT_OPT_DIR"       ]] && cmd+=" --opt-dir ${OPT_DIR}"
+  [[ "$CASE_ROOT"     != "$DEFAULT_CASE_ROOT"     ]] && cmd+=" --case-root ${CASE_ROOT}"
+  [[ "$EVIDENCE_ROOT" != "$DEFAULT_EVIDENCE_ROOT" ]] && cmd+=" --evidence-root ${EVIDENCE_ROOT}"
+  (( UDEV_RO ))     || cmd+=" --no-udev-ro"
+  (( POLKIT_RULE )) || cmd+=" --no-polkit"
   (( FORCE ))   && cmd+=" --force"
   (( DRY_RUN )) && cmd+=" --dry-run"
   printf '%s --yes' "$cmd"
@@ -1089,6 +1237,12 @@ summary_text() {
     printf 'Completed: %s (%s)\n' "${done_mods[*]}" "$( (( FORCE )) && echo 're-run' || echo 'skipped')"
   fi
   printf 'User:      %s (%s)\n' "$TARGET_USER" "$TARGET_HOME"
+  printf 'Tools:     %s\n' "$OPT_DIR"
+  if in_array hygiene "${SELECTED[@]}"; then
+    printf 'Cases:     %s    Evidence: %s\n' "$CASE_ROOT" "$EVIDENCE_ROOT"
+    printf 'Rules:     read-only USB disks %s, mounting needs admin %s\n' \
+      "$(onoff "$UDEV_RO")" "$(onoff "$POLKIT_RULE")"
+  fi
   printf 'Dry run:   %s\n' "$( (( DRY_RUN )) && echo yes || echo no)"
   printf '\nEquivalent command:\n  %s\n' "$(equivalent_cmd)"
 }
@@ -1099,6 +1253,7 @@ run_wizard() {
   while :; do
     pick_modules
     ask_force
+    edit_settings
     ask_yn "$(summary_text)
 
 Proceed? Choose No to change the selection." y && break
@@ -1129,6 +1284,14 @@ OPTIONS
   --only  a,b,c        Run only these modules
   --profile NAME       Run a predefined module set (see --list)
   --skip  a,b,c        Exclude these modules
+  --user NAME          Account to set up (default: the user who ran sudo)
+  --opt-dir DIR        Folder for downloaded tools (default: ${DEFAULT_OPT_DIR})
+  --case-root DIR      Folder for case directories (default: ${DEFAULT_CASE_ROOT})
+  --evidence-root DIR  Folder for evidence mounts (default: ${DEFAULT_EVIDENCE_ROOT})
+  --no-udev-ro         hygiene: don't force removable disks read-only
+                       (removes the rule if an earlier run installed it)
+  --no-polkit          hygiene: don't require admin auth to mount removable media
+                       (removes the rule if an earlier run installed it)
   --force              Ignore completion markers and redo everything
   --dry-run            Print what would happen, change nothing
   -i, --interactive    Open the wizard; other options become its defaults
@@ -1141,6 +1304,8 @@ NOTES
   * With no options in a terminal, the wizard asks what to install. Without
     a terminal (CI, pipes) and no options, this help is shown instead.
   * 'core' is always run first when other modules are selected.
+  * Folder and hygiene options take effect when hygiene runs; to change them
+    after it has completed, re-run it: --only hygiene --force <options>.
   * Missing upstream packages are logged, never fatal.
   * Re-running after a VM rebuild reproduces the same state.
 EOF
@@ -1174,6 +1339,13 @@ parse_args() {
                  PROFILE="$2"; read -ra SELECTED <<< "${PROFILE_MODULES[$2]}"
                  SET_BY_FLAG[selection]=1; shift ;;
       --skip)    need_arg "$1" "${2:-}"; IFS=',' read -ra SKIPPED <<< "$2"; shift ;;
+      --user)    need_arg "$1" "${2:-}"
+                 set_target_user "$2" || die "No such user: $2"; shift ;;
+      --opt-dir)       need_arg "$1" "${2:-}"; OPT_DIR="${2%/}"; shift ;;
+      --case-root)     need_arg "$1" "${2:-}"; CASE_ROOT="${2%/}"; shift ;;
+      --evidence-root) need_arg "$1" "${2:-}"; EVIDENCE_ROOT="${2%/}"; shift ;;
+      --no-udev-ro)    UDEV_RO=0 ;;
+      --no-polkit)     POLKIT_RULE=0 ;;
       --force)   FORCE=1; SET_BY_FLAG[force]=1 ;;
       --dry-run) DRY_RUN=1; SET_BY_FLAG[dry_run]=1 ;;
       -i|--interactive)          INTERACTIVE=1 ;;
@@ -1197,6 +1369,7 @@ main() {
   for m in "${SELECTED[@]}" "${SKIPPED[@]}"; do
     in_array "$m" "${ALL_MODULES[@]}" || die "Unknown module: ${m} (see --list)"
   done
+  check_settings
 
   if want_wizard; then
     is_root || (( DRY_RUN )) || \
@@ -1207,6 +1380,7 @@ main() {
   fi
 
   ((${#SELECTED[@]})) || die "Nothing selected. Use --all, --only <modules> or --profile <name>."
+  MANIFEST="${OPT_DIR}/MANIFEST.md"
   is_root || (( DRY_RUN )) || die "Run with sudo (installs system packages)."
 
   (( DRY_RUN )) || { mkdir -p "$(dirname "$LOG_FILE")"; touch "$LOG_FILE"; }
@@ -1220,6 +1394,7 @@ main() {
 
   hdr "${SCRIPT_NAME} v${SCRIPT_VERSION}"
   log "User:        ${TARGET_USER} (${TARGET_HOME})"
+  log "Tools:       ${OPT_DIR}"
   log "Modules:     ${SELECTED[*]}"
   ((${#SKIPPED[@]})) && log "Skipping:    ${SKIPPED[*]}"
   (( DRY_RUN ))      && warn "DRY RUN - no changes will be made"
