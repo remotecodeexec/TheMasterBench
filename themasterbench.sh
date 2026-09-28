@@ -56,6 +56,12 @@ TARGET_USER="${SUDO_USER:-${USER:-root}}"
 TARGET_HOME="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
 TARGET_HOME="${TARGET_HOME:-/root}"
 DEFAULT_TARGET_USER="$TARGET_USER"      # --user or the wizard can change it
+DEFAULT_TARGET_HOME="$TARGET_HOME"
+
+#--- Saved settings (see load_settings) ---------------------------------------
+DEFAULT_CONFIG_FILE="${DEFAULT_TARGET_HOME}/.config/themasterbench/settings.conf"
+CONFIG_FILE="$DEFAULT_CONFIG_FILE"      # --config FILE; empty with --no-config
+CONFIG_LOADED=0
 
 #===============================================================================
 # Module registry  (order matters: 'core' first)
@@ -1207,6 +1213,111 @@ edit_settings() {
   done
 }
 
+#--- Saved settings file ------------------------------------------------------
+# Settings are saved after each real run and loaded at the start of the next,
+# from the home folder of the account that ran sudo. Root reads a file that
+# user can edit, so it is parsed as key=value (never sourced) and every value
+# is validated.
+
+# bool_val <text> -- prints 1 or 0; fails on anything else.
+bool_val() {
+  case "${1,,}" in
+    1|yes|on|true)  echo 1 ;;
+    0|no|off|false) echo 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Handles --config / --no-config before anything else, so the file can be
+# loaded underneath the other options. --help/--list/--verify skip it.
+prescan_config() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config)    need_arg "$1" "${2:-}"; CONFIG_FILE="$(realpath -m -- "$2")"; shift ;;
+      --no-config) CONFIG_FILE="" ;;
+      -h|--help|--list|--verify) CONFIG_FILE=""; return 0 ;;
+    esac
+    shift
+  done
+}
+
+load_settings() {
+  [[ -n "$CONFIG_FILE" && -f "$CONFIG_FILE" ]] || return 0
+  local line key val n=0 where
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$(( n + 1 )); where="${CONFIG_FILE}:${n}"
+    [[ "$line" =~ ^[[:space:]]*(#.*)?$ ]] && continue
+    [[ "$line" =~ ^[[:space:]]*([a-z_]+)[[:space:]]*=[[:space:]]*(.*[^[:space:]])?[[:space:]]*$ ]] \
+      || die "${where}: expected key=value"
+    key="${BASH_REMATCH[1]}"; val="${BASH_REMATCH[2]:-}"
+    case "$key" in
+      user) set_target_user "$val" || die "${where}: no such user: ${val}" ;;
+      opt_dir|case_root|evidence_root)
+        val="${val%/}"
+        valid_path "$val" || die "${where}: invalid folder: ${val}"
+        case "$key" in
+          opt_dir)   OPT_DIR="$val" ;;
+          case_root) CASE_ROOT="$val" ;;
+          *)         EVIDENCE_ROOT="$val" ;;
+        esac ;;
+      udev_ro)     UDEV_RO=$(bool_val "$val")     || die "${where}: udev_ro must be 1 or 0" ;;
+      polkit_rule) POLKIT_RULE=$(bool_val "$val") || die "${where}: polkit_rule must be 1 or 0" ;;
+      *) warn "${where}: unknown setting '${key}' (ignored)" ;;
+    esac
+  done < "$CONFIG_FILE"
+  CONFIG_LOADED=1
+}
+
+# Called in an '||' context (set -e is off inside), so every step is checked.
+_write_settings() {
+  local dir="${CONFIG_FILE%/*}" owner="" d tmp
+  if [[ "$CONFIG_FILE" == "$DEFAULT_CONFIG_FILE" ]]; then
+    owner="$DEFAULT_TARGET_USER"
+    [[ -d "$DEFAULT_TARGET_HOME" ]] || return 1
+    for d in "${dir%/*}" "$dir"; do     # ~/.config, ~/.config/themasterbench
+      [[ -d "$d" ]] && continue
+      mkdir "$d" && chown "${owner}:" "$d" || return 1
+    done
+  else
+    mkdir -p "$dir" || return 1
+  fi
+  tmp=$(mktemp "${dir}/.settings.XXXXXX") || return 1
+  {
+    echo "# TheMasterBench settings, saved $(_ts) by ${SCRIPT_NAME} v${SCRIPT_VERSION}."
+    echo "# Loaded on every run; command-line options and the wizard override them."
+    echo "# Delete this file to go back to the built-in defaults."
+    echo "user=${TARGET_USER}"
+    echo "opt_dir=${OPT_DIR}"
+    echo "case_root=${CASE_ROOT}"
+    echo "evidence_root=${EVIDENCE_ROOT}"
+    echo "udev_ro=${UDEV_RO}"
+    echo "polkit_rule=${POLKIT_RULE}"
+  } > "$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 0644 "$tmp" || return 1
+  if [[ -n "$owner" ]]; then chown "${owner}:" "$tmp" || return 1; fi
+  # rename() replaces a symlink at the destination instead of following it.
+  mv -f "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; return 1; }
+}
+
+save_settings() {
+  [[ -n "$CONFIG_FILE" ]] && (( ! DRY_RUN )) || return 0
+  if _write_settings; then
+    ok "Settings saved: ${CONFIG_FILE}"
+  else
+    warn "Could not save settings to ${CONFIG_FILE}"
+  fi
+}
+
+settings_status() {
+  if [[ -z "$CONFIG_FILE" ]]; then
+    echo "not read or saved (--no-config)"
+  elif (( DRY_RUN )); then
+    printf '%s (%s; not saved in a dry run)' "$CONFIG_FILE" "$( (( CONFIG_LOADED )) && echo loaded || echo none yet)"
+  else
+    printf '%s (%s; saved when the run starts)' "$CONFIG_FILE" "$( (( CONFIG_LOADED )) && echo loaded || echo new)"
+  fi
+}
+
 equivalent_cmd() {
   local cmd="sudo ./${SCRIPT_NAME}"
   if [[ -n "$PROFILE" ]]; then
@@ -1221,6 +1332,11 @@ equivalent_cmd() {
   [[ "$OPT_DIR"       != "$DEFAULT_OPT_DIR"       ]] && cmd+=" --opt-dir ${OPT_DIR}"
   [[ "$CASE_ROOT"     != "$DEFAULT_CASE_ROOT"     ]] && cmd+=" --case-root ${CASE_ROOT}"
   [[ "$EVIDENCE_ROOT" != "$DEFAULT_EVIDENCE_ROOT" ]] && cmd+=" --evidence-root ${EVIDENCE_ROOT}"
+  if [[ -z "$CONFIG_FILE" ]]; then
+    cmd+=" --no-config"
+  elif [[ "$CONFIG_FILE" != "$DEFAULT_CONFIG_FILE" ]]; then
+    cmd+=" --config $(printf '%q' "$CONFIG_FILE")"
+  fi
   (( UDEV_RO ))     || cmd+=" --no-udev-ro"
   (( POLKIT_RULE )) || cmd+=" --no-polkit"
   (( FORCE ))   && cmd+=" --force"
@@ -1244,6 +1360,7 @@ summary_text() {
       "$(onoff "$UDEV_RO")" "$(onoff "$POLKIT_RULE")"
   fi
   printf 'Dry run:   %s\n' "$( (( DRY_RUN )) && echo yes || echo no)"
+  printf 'Settings:  %s\n' "$(settings_status)"
   printf '\nEquivalent command:\n  %s\n' "$(equivalent_cmd)"
 }
 
@@ -1292,6 +1409,11 @@ OPTIONS
                        (removes the rule if an earlier run installed it)
   --no-polkit          hygiene: don't require admin auth to mount removable media
                        (removes the rule if an earlier run installed it)
+  --udev-ro, --polkit  Turn a rule back on after a saved "off" setting
+  --config FILE        Settings file to load and save
+                       (default: ~/.config/themasterbench/settings.conf
+                       in the home of the account that ran sudo)
+  --no-config          Don't load or save a settings file
   --force              Ignore completion markers and redo everything
   --dry-run            Print what would happen, change nothing
   -i, --interactive    Open the wizard; other options become its defaults
@@ -1304,7 +1426,9 @@ NOTES
   * With no options in a terminal, the wizard asks what to install. Without
     a terminal (CI, pipes) and no options, this help is shown instead.
   * 'core' is always run first when other modules are selected.
-  * Folder and hygiene options take effect when hygiene runs; to change them
+  * Settings (--user, folders, rules) are saved after each run and reused by
+    the next one. Options on the command line override the saved values.
+  * Folder and hygiene settings take effect when hygiene runs; to change them
     after it has completed, re-run it: --only hygiene --force <options>.
   * Missing upstream packages are logged, never fatal.
   * Re-running after a VM rebuild reproduces the same state.
@@ -1346,6 +1470,10 @@ parse_args() {
       --evidence-root) need_arg "$1" "${2:-}"; EVIDENCE_ROOT="${2%/}"; shift ;;
       --no-udev-ro)    UDEV_RO=0 ;;
       --no-polkit)     POLKIT_RULE=0 ;;
+      --udev-ro)       UDEV_RO=1 ;;
+      --polkit)        POLKIT_RULE=1 ;;
+      --config)        shift ;;   # handled by prescan_config
+      --no-config)     ;;
       --force)   FORCE=1; SET_BY_FLAG[force]=1 ;;
       --dry-run) DRY_RUN=1; SET_BY_FLAG[dry_run]=1 ;;
       -i|--interactive)          INTERACTIVE=1 ;;
@@ -1362,6 +1490,9 @@ parse_args() {
 in_array() { local n="$1"; shift; local e; for e in "$@"; do [[ "$e" == "$n" ]] && return 0; done; return 1; }
 
 main() {
+  # Saved settings sit underneath the command-line options.
+  prescan_config "$@"
+  load_settings
   parse_args "$@"
 
   # Validate names before the wizard uses them as defaults.
@@ -1386,6 +1517,7 @@ main() {
   (( DRY_RUN )) || { mkdir -p "$(dirname "$LOG_FILE")"; touch "$LOG_FILE"; }
   _log_raw "=== ${SCRIPT_NAME} v${SCRIPT_VERSION} start (user=${TARGET_USER}) ==="
   _log_raw "Equivalent command: $(equivalent_cmd)"
+  save_settings
 
   # Always front-load 'core'
   if ! in_array core "${SELECTED[@]}"; then
@@ -1395,6 +1527,7 @@ main() {
   hdr "${SCRIPT_NAME} v${SCRIPT_VERSION}"
   log "User:        ${TARGET_USER} (${TARGET_HOME})"
   log "Tools:       ${OPT_DIR}"
+  log "Settings:    $(settings_status)"
   log "Modules:     ${SELECTED[*]}"
   ((${#SKIPPED[@]})) && log "Skipping:    ${SKIPPED[*]}"
   (( DRY_RUN ))      && warn "DRY RUN - no changes will be made"

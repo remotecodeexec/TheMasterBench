@@ -141,14 +141,38 @@ These options can also be changed on the wizard's Settings screen:
 | `--no-udev-ro` | Rule installed | Don't force removable disks read-only |
 | `--no-polkit` | Rule installed | Don't require an admin password to mount removable media |
 
-The last four apply to the `hygiene` module. Settings are not remembered between
-runs, so pass the same options again when you rerun it, for example:
+The last four apply to the `hygiene` module. If an earlier run installed a rule,
+`--no-udev-ro` or `--no-polkit` removes it; `--udev-ro` and `--polkit` turn a
+rule back on.
+
+### Saved settings
+
+After each run (except dry runs) the settings above are saved to
+`~/.config/themasterbench/settings.conf`, in the home folder of the account that
+ran `sudo`, and the next run starts from them. You don't have to repeat your
+options, and a rerun of `hygiene` keeps the same folders:
 
 ```bash
-sudo ./themasterbench.sh --only hygiene --force --case-root /srv/cases --no-polkit
+sudo ./themasterbench.sh --only hygiene --case-root /srv/cases   # saves /srv/cases
+sudo ./themasterbench.sh --only hygiene --force                   # still uses /srv/cases
 ```
 
-If an earlier run installed a rule, `--no-udev-ro` or `--no-polkit` removes it.
+Options on the command line override saved values, and the wizard shows the saved
+values as its starting point. The file is plain `key=value` lines:
+
+```ini
+user=kali
+opt_dir=/opt/themasterbench
+case_root=/srv/cases
+evidence_root=/evidence
+udev_ro=1
+polkit_rule=1
+```
+
+Delete the file to go back to the defaults. Use `--config FILE` to load and save a
+different file, for example one kept with your VM build notes, or `--no-config`
+to ignore saved settings for one run. The script reads the file as data (it is
+never run as a script) and rejects invalid values.
 
 ## Working with cases
 
